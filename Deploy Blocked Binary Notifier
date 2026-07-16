@@ -1,0 +1,925 @@
+#!/bin/bash
+
+####################################################################################################
+#
+# Deploy Blocked Binary Notifier + Hardening + Watchdog
+#
+# Purpose:
+# Creates and loads a LaunchDaemon that monitors Apple's Device Management Endpoint Security
+# LaunchPolicy DENIED logs and displays a swiftDialog notification to the logged-in user.
+#
+# Also deploys a watchdog LaunchDaemon to protect the notifier files and keep the notifier loaded.
+#
+# Expected Apple log format:
+# DENIED exec: pid 44526, path /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+#
+####################################################################################################
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
+
+####################################################################################################
+# Variables
+####################################################################################################
+
+SCRIPT_NAME="Deploy Blocked Binary Notifier"
+
+NOTIFIER_SCRIPT_DIR="/Library/Management/Scripts"
+NOTIFIER_SCRIPT_PATH="${NOTIFIER_SCRIPT_DIR}/blocked-binary-notifier.sh"
+
+NOTIFIER_LAUNCHDAEMON_LABEL="com.security.mac.blocked-binary-notifier"
+NOTIFIER_LAUNCHDAEMON_PATH="/Library/LaunchDaemons/${NOTIFIER_LAUNCHDAEMON_LABEL}.plist"
+
+WATCHDOG_SCRIPT_PATH="${NOTIFIER_SCRIPT_DIR}/blocked-binary-notifier-watchdog.sh"
+WATCHDOG_LAUNCHDAEMON_LABEL="com.security.mac.blocked-binary-notifier-watchdog"
+WATCHDOG_LAUNCHDAEMON_PATH="/Library/LaunchDaemons/${WATCHDOG_LAUNCHDAEMON_LABEL}.plist"
+
+DEPLOY_LOG="/var/log/blocked-binary-notifier-deploy.log"
+
+DIALOG_BIN="/usr/local/bin/dialog"
+DIALOG_APP_BIN="/Library/Application Support/Dialog/Dialog.app/Contents/MacOS/Dialog"
+
+PROTECTED_FILES=(
+    "$NOTIFIER_SCRIPT_PATH"
+    "$NOTIFIER_LAUNCHDAEMON_PATH"
+    "$WATCHDOG_SCRIPT_PATH"
+    "$WATCHDOG_LAUNCHDAEMON_PATH"
+)
+
+####################################################################################################
+# Logging
+####################################################################################################
+
+log_info() {
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$DEPLOY_LOG"
+}
+
+log_warn() {
+    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$DEPLOY_LOG"
+}
+
+log_error() {
+    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$DEPLOY_LOG"
+}
+
+####################################################################################################
+# Pre-flight
+####################################################################################################
+
+log_info "Starting ${SCRIPT_NAME}"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    log_error "This deployment script must be run as root."
+    exit 1
+fi
+
+if [[ ! -x "$DIALOG_BIN" && ! -x "$DIALOG_APP_BIN" ]]; then
+    log_warn "swiftDialog was not found."
+    log_warn "Expected one of:"
+    log_warn "$DIALOG_BIN"
+    log_warn "$DIALOG_APP_BIN"
+    log_warn "The notifier will still be installed, but user notifications will not display until swiftDialog is installed."
+else
+    log_info "swiftDialog detected."
+fi
+
+####################################################################################################
+# Create script directory
+####################################################################################################
+
+log_info "Creating script directory: ${NOTIFIER_SCRIPT_DIR}"
+
+mkdir -p "$NOTIFIER_SCRIPT_DIR"
+
+if [[ ! -d "$NOTIFIER_SCRIPT_DIR" ]]; then
+    log_error "Failed to create script directory: ${NOTIFIER_SCRIPT_DIR}"
+    exit 1
+fi
+
+####################################################################################################
+# Remove immutable flags before update
+####################################################################################################
+
+log_info "Removing immutable flags from existing deployment files if present."
+
+for item in "${PROTECTED_FILES[@]}"; do
+    if [[ -e "$item" ]]; then
+        log_info "Removing immutable flag from: $item"
+        /usr/bin/chflags nouchg "$item" 2>/dev/null
+    fi
+done
+
+####################################################################################################
+# Write notifier script
+####################################################################################################
+
+log_info "Writing notifier script: ${NOTIFIER_SCRIPT_PATH}"
+
+cat > "$NOTIFIER_SCRIPT_PATH" <<'NOTIFIER_SCRIPT'
+#!/bin/bash
+
+####################################################################################################
+#
+# Blocked Binary Notifier
+#
+# Purpose:
+# Watches Apple's managedeventsd LaunchPolicy logs for DENIED binary execution events and displays
+# a swiftDialog notification to the logged-in user.
+#
+####################################################################################################
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
+
+SCRIPT_NAME="Blocked Binary Notifier"
+LOG_FILE="/var/log/blocked-binary-notifier.log"
+
+DIALOG_BIN="/usr/local/bin/dialog"
+DIALOG_APP_BIN="/Library/Application Support/Dialog/Dialog.app/Contents/MacOS/Dialog"
+
+COOLDOWN_SECONDS="20"
+
+LAST_EVENT_HASH=""
+LAST_EVENT_TIME="0"
+
+INFO_BUTTON_TEXT="Request Access"
+INFO_BUTTON_ACTION="www.google.coms"
+INFO_BUTTON_SYMBOL="lock.document"
+
+LOG_PREDICATE='subsystem == "com.apple.devicemanagementclient.managedeventsd" AND category == "LaunchPolicy" AND eventMessage CONTAINS[c] "DENIED"'
+
+log_info() {
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+log_warn() {
+    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+get_dialog_binary() {
+    if [[ -x "$DIALOG_BIN" ]]; then
+        echo "$DIALOG_BIN"
+        return 0
+    fi
+
+    if [[ -x "$DIALOG_APP_BIN" ]]; then
+        echo "$DIALOG_APP_BIN"
+        return 0
+    fi
+
+    return 1
+}
+
+get_logged_in_user() {
+    /usr/sbin/scutil <<< "show State:/Users/ConsoleUser" | /usr/bin/awk '/Name :/ && $3 != "loginwindow" { print $3 }'
+}
+
+get_logged_in_uid() {
+    local current_user="$1"
+
+    if [[ -n "$current_user" ]]; then
+        /usr/bin/id -u "$current_user" 2>/dev/null
+    fi
+}
+
+markdown_escape_table_value() {
+    local value="$1"
+
+    value="${value//$'\n'/ }"
+    value="${value//$'\r'/ }"
+    value="${value//|/\\|}"
+
+    echo "$value"
+}
+
+markdown_escape_colour_value() {
+    local value="$1"
+
+    value="${value//]/\\]}"
+    value="${value//[/\\[}"
+
+    echo "$value"
+}
+
+extract_denied_binary_path() {
+    local log_line="$1"
+    local denied_path=""
+
+    denied_path="$(printf "%s" "$log_line" | /usr/bin/sed -E 's/.*DENIED exec: pid [0-9]+, path (.*)$/\1/')"
+
+    if [[ "$denied_path" == "$log_line" ]]; then
+        denied_path="$(printf "%s" "$log_line" | /usr/bin/sed -E 's/.*path (\/.*)$/\1/')"
+    fi
+
+    if [[ "$denied_path" == "$log_line" ]]; then
+        denied_path=""
+    fi
+
+    echo "$denied_path"
+}
+
+derive_app_bundle_path() {
+    local binary_path="$1"
+    local app_path=""
+
+    app_path="$(printf "%s" "$binary_path" | /usr/bin/perl -ne 'if (m#^(.+?\.app)(?:/.*)?$#) { print $1 }')"
+
+    echo "$app_path"
+}
+
+get_codesign_target() {
+    local binary_path="$1"
+    local app_path="$2"
+
+    if [[ -n "$app_path" && -e "$app_path" ]]; then
+        echo "$app_path"
+        return 0
+    fi
+
+    if [[ -n "$binary_path" && -e "$binary_path" ]]; then
+        echo "$binary_path"
+        return 0
+    fi
+
+    echo ""
+}
+
+get_signing_id() {
+    local target_path="$1"
+    local value=""
+
+    if [[ -n "$target_path" && -e "$target_path" ]]; then
+        value="$(/usr/bin/codesign -dv "$target_path" 2>&1 | /usr/bin/awk -F= '/^Identifier=/ {print $2}' | /usr/bin/head -n 1)"
+    fi
+
+    echo "$value"
+}
+
+get_team_id() {
+    local target_path="$1"
+    local value=""
+
+    if [[ -n "$target_path" && -e "$target_path" ]]; then
+        value="$(/usr/bin/codesign -dv "$target_path" 2>&1 | /usr/bin/awk -F= '/^TeamIdentifier=/ {print $2}' | /usr/bin/head -n 1)"
+    fi
+
+    echo "$value"
+}
+
+get_cd_hash() {
+    local app_path="$1"
+    local binary_path="$2"
+    local value=""
+
+    if [[ -n "$binary_path" && -e "$binary_path" ]]; then
+        value="$(/usr/bin/codesign -dv --verbose=4 "$binary_path" 2>&1 | /usr/bin/awk -F= '/^CDHash=/ {print $2}' | /usr/bin/head -n 1)"
+    fi
+
+    if [[ -z "$value" && -n "$app_path" && -e "$app_path" ]]; then
+        value="$(/usr/bin/codesign -dv --verbose=4 "$app_path" 2>&1 | /usr/bin/awk -F= '/^CDHash=/ {print $2}' | /usr/bin/head -n 1)"
+    fi
+
+    echo "$value"
+}
+
+get_display_name() {
+    local app_path="$1"
+    local binary_path="$2"
+    local signing_id="$3"
+    local display_name=""
+
+    if [[ -n "$app_path" && -d "$app_path" ]]; then
+        display_name="$(/usr/bin/defaults read "${app_path}/Contents/Info.plist" CFBundleDisplayName 2>/dev/null)"
+
+        if [[ -z "$display_name" ]]; then
+            display_name="$(/usr/bin/defaults read "${app_path}/Contents/Info.plist" CFBundleName 2>/dev/null)"
+        fi
+
+        if [[ -z "$display_name" ]]; then
+            display_name="$(/usr/bin/basename "$app_path" .app)"
+        fi
+    fi
+
+    if [[ -z "$display_name" && -n "$binary_path" && "$binary_path" != "Unknown" ]]; then
+        display_name="$(/usr/bin/basename "$binary_path")"
+    fi
+
+    if [[ -z "$display_name" && -n "$signing_id" && "$signing_id" != "Unknown" ]]; then
+        display_name="$signing_id"
+    fi
+
+    if [[ -z "$display_name" ]]; then
+        display_name="Blocked application"
+    fi
+
+    echo "$display_name"
+}
+
+get_app_icon_path() {
+    local app_path="$1"
+    local icon_file=""
+    local icon_path=""
+    local fallback_icon="SF=xmark.shield.fill"
+
+    if [[ -z "$app_path" || ! -d "$app_path" ]]; then
+        echo "$fallback_icon"
+        return 0
+    fi
+
+    if [[ ! -f "${app_path}/Contents/Info.plist" ]]; then
+        echo "$fallback_icon"
+        return 0
+    fi
+
+    icon_file="$(/usr/bin/defaults read "${app_path}/Contents/Info.plist" CFBundleIconFile 2>/dev/null)"
+
+    if [[ -z "$icon_file" ]]; then
+        echo "$fallback_icon"
+        return 0
+    fi
+
+    if [[ "$icon_file" == /* && -f "$icon_file" ]]; then
+        echo "$icon_file"
+        return 0
+    fi
+
+    if [[ "$icon_file" != *.icns ]]; then
+        icon_file="${icon_file}.icns"
+    fi
+
+    icon_path="${app_path}/Contents/Resources/${icon_file}"
+
+    if [[ -f "$icon_path" ]]; then
+        echo "$icon_path"
+        return 0
+    fi
+
+    echo "$fallback_icon"
+}
+
+should_suppress_duplicate() {
+    local event_line="$1"
+    local now
+    local event_hash
+    local elapsed
+
+    now="$(date +%s)"
+    event_hash="$(printf "%s" "$event_line" | /sbin/md5 -q 2>/dev/null)"
+
+    if [[ -z "$event_hash" ]]; then
+        event_hash="$(printf "%s" "$event_line" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+    fi
+
+    if [[ "$event_hash" == "$LAST_EVENT_HASH" ]]; then
+        elapsed=$((now - LAST_EVENT_TIME))
+
+        if (( elapsed < COOLDOWN_SECONDS )); then
+            return 0
+        fi
+    fi
+
+    LAST_EVENT_HASH="$event_hash"
+    LAST_EVENT_TIME="$now"
+
+    return 1
+}
+
+show_block_dialog() {
+    local raw_event="$1"
+
+    local dialog_binary
+    dialog_binary="$(get_dialog_binary)"
+
+    if [[ -z "$dialog_binary" ]]; then
+        log_error "swiftDialog is not installed. Cannot show user notification."
+        return 1
+    fi
+
+    local current_user
+    current_user="$(get_logged_in_user)"
+
+    if [[ -z "$current_user" ]]; then
+        log_warn "No logged-in user detected. Skipping dialog."
+        return 1
+    fi
+
+    if [[ "$current_user" == "root" || "$current_user" == "loginwindow" ]]; then
+        log_warn "No active user session detected. Skipping dialog."
+        return 1
+    fi
+
+    local current_uid
+    current_uid="$(get_logged_in_uid "$current_user")"
+
+    if [[ -z "$current_uid" ]]; then
+        log_warn "Unable to determine UID for user: $current_user"
+        return 1
+    fi
+
+    local binary_path
+    local app_path
+    local codesign_target
+    local signing_id
+    local team_id
+    local cd_hash
+    local app_name
+    local dialog_icon
+
+    binary_path="$(extract_denied_binary_path "$raw_event")"
+
+    if [[ -z "$binary_path" || "$binary_path" != /* ]]; then
+        log_warn "Skipping dialog because blocked binary path is invalid or empty."
+        log_warn "Raw event: $raw_event"
+        return 0
+    fi
+
+    app_path="$(derive_app_bundle_path "$binary_path")"
+    codesign_target="$(get_codesign_target "$binary_path" "$app_path")"
+
+    signing_id="$(get_signing_id "$codesign_target")"
+    team_id="$(get_team_id "$codesign_target")"
+    cd_hash="$(get_cd_hash "$app_path" "$binary_path")"
+
+    [[ -z "$app_path" ]] && app_path="Not detected"
+    [[ -z "$codesign_target" ]] && codesign_target="Not available"
+    [[ -z "$signing_id" ]] && signing_id="Unknown"
+    [[ -z "$team_id" ]] && team_id="Unknown"
+    [[ -z "$cd_hash" ]] && cd_hash="Unknown"
+
+    app_name="$(get_display_name "$app_path" "$binary_path" "$signing_id")"
+    dialog_icon="$(get_app_icon_path "$app_path")"
+
+    local table_app_name
+    local table_signing_id
+    local table_team_id
+    local table_cd_hash
+    local table_app_path
+    local table_binary_path
+    local heading_app_name
+
+    table_app_name="$(markdown_escape_table_value "$app_name")"
+    table_signing_id="$(markdown_escape_table_value "$signing_id")"
+    table_team_id="$(markdown_escape_table_value "$team_id")"
+    table_cd_hash="$(markdown_escape_table_value "$cd_hash")"
+    table_app_path="$(markdown_escape_table_value "$app_path")"
+    table_binary_path="$(markdown_escape_table_value "$binary_path")"
+    heading_app_name="$(markdown_escape_colour_value "$app_name")"
+
+    local message
+    message="### :red[${heading_app_name}] is blocked
+
+This application or binary has been blocked by your organisation's macOS security policy.
+
+**What happened**
+
+macOS denied the launch attempt because it matched a managed application control rule.
+
+**Blocked item details**
+
+| Security Attribute | Value |
+|---|---|
+| Application | ${table_app_name} |
+| Signing ID | ${table_signing_id} |
+| Team ID | ${table_team_id} |
+| CDHash | ${table_cd_hash} |
+| Application bundle | ${table_app_path} |
+| Blocked binary | ${table_binary_path} |
+
+If this application is required for business use, select **${INFO_BUTTON_TEXT}** or contact IT Support and provide the details above."
+
+    log_info "Showing blocked binary dialog to user: $current_user"
+    log_info "Blocked Application=${app_name}"
+    log_info "Blocked Binary=${binary_path}"
+    log_info "Application Bundle=${app_path}"
+    log_info "CodeSign Target=${codesign_target}"
+    log_info "SigningID=${signing_id}"
+    log_info "TeamID=${team_id}"
+    log_info "CDHash=${cd_hash}"
+    log_info "Dialog Icon=${dialog_icon}"
+
+    /bin/launchctl asuser "$current_uid" /usr/bin/sudo -u "$current_user" "$dialog_binary" \
+        --title "Application Blocked" \
+        --subtitle "${app_name} is blocked" \
+        --message "$message" \
+        --messagealignment left \
+        --messagefont "size=12" \
+        --icon "$dialog_icon" \
+        --overlayicon "SF=lock.shield.fill" \
+        --button1text "OK" \
+        --infobutton \
+        --infobuttontext "$INFO_BUTTON_TEXT" \
+        --infobuttonsymbol "$INFO_BUTTON_SYMBOL" \
+        --infobuttonaction "$INFO_BUTTON_ACTION" \
+        --width 850 \
+        --height 560 \
+        --moveable \
+        --ontop \
+        --quitkey "k" >/dev/null 2>&1 &
+
+    return 0
+}
+
+log_info "Starting ${SCRIPT_NAME}"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    log_error "This script should be run as root via LaunchDaemon."
+    exit 1
+fi
+
+if ! get_dialog_binary >/dev/null 2>&1; then
+    log_error "swiftDialog not found. Expected /usr/local/bin/dialog or ${DIALOG_APP_BIN}"
+    log_error "Continuing to monitor logs, but dialogs cannot be displayed until swiftDialog is installed."
+fi
+
+log_info "Monitoring starts immediately."
+log_info "Only real LaunchPolicy DENIED exec events with a valid absolute path will trigger a dialog."
+log_info "Predicate: ${LOG_PREDICATE}"
+
+/usr/bin/log stream \
+    --style syslog \
+    --predicate "$LOG_PREDICATE" 2>/dev/null | while IFS= read -r log_line
+do
+    [[ -z "$log_line" ]] && continue
+
+    if [[ "$log_line" != *"DENIED exec:"* ]]; then
+        log_info "Ignoring non-exec DENIED event."
+        log_info "Ignored event: $log_line"
+        continue
+    fi
+
+    if [[ "$log_line" != *", path /"* ]]; then
+        log_warn "Ignoring DENIED exec event without a valid path."
+        log_warn "Ignored event: $log_line"
+        continue
+    fi
+
+    candidate_binary_path="$(extract_denied_binary_path "$log_line")"
+
+    if [[ -z "$candidate_binary_path" || "$candidate_binary_path" != /* ]]; then
+        log_warn "Ignoring DENIED exec event because no valid binary path could be extracted."
+        log_warn "Ignored event: $log_line"
+        continue
+    fi
+
+    if should_suppress_duplicate "$log_line"; then
+        log_warn "Duplicate DENIED event suppressed."
+        continue
+    fi
+
+    log_info "DENIED launch event detected."
+    log_info "Raw event: $log_line"
+
+    show_block_dialog "$log_line"
+done
+
+log_warn "log stream ended unexpectedly."
+
+exit 0
+NOTIFIER_SCRIPT
+
+####################################################################################################
+# Write notifier LaunchDaemon
+####################################################################################################
+
+log_info "Writing notifier LaunchDaemon: ${NOTIFIER_LAUNCHDAEMON_PATH}"
+
+cat > "$NOTIFIER_LAUNCHDAEMON_PATH" <<NOTIFIER_LAUNCHDAEMON_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${NOTIFIER_LAUNCHDAEMON_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${NOTIFIER_SCRIPT_PATH}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/blocked-binary-notifier.launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/blocked-binary-notifier.launchd.error.log</string>
+</dict>
+</plist>
+NOTIFIER_LAUNCHDAEMON_PLIST
+
+####################################################################################################
+# Write watchdog script
+####################################################################################################
+
+log_info "Writing watchdog script: ${WATCHDOG_SCRIPT_PATH}"
+
+cat > "$WATCHDOG_SCRIPT_PATH" <<'WATCHDOG_SCRIPT'
+#!/bin/bash
+
+####################################################################################################
+#
+# Blocked Binary Notifier Watchdog
+#
+# Purpose:
+# Protects the blocked binary notifier script and LaunchDaemon, and ensures the notifier LaunchDaemon
+# remains loaded.
+#
+####################################################################################################
+
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin"
+
+LOG_FILE="/var/log/blocked-binary-notifier-watchdog.log"
+
+NOTIFIER_SCRIPT_PATH="/Library/Management/Scripts/blocked-binary-notifier.sh"
+NOTIFIER_LAUNCHDAEMON_LABEL="com.security.mac.blocked-binary-notifier"
+NOTIFIER_LAUNCHDAEMON_PATH="/Library/LaunchDaemons/com.security.mac.blocked-binary-notifier.plist"
+
+WATCHDOG_SCRIPT_PATH="/Library/Management/Scripts/blocked-binary-notifier-watchdog.sh"
+WATCHDOG_LAUNCHDAEMON_PATH="/Library/LaunchDaemons/com.security.mac.blocked-binary-notifier-watchdog.plist"
+
+PROTECTED_ITEMS=(
+    "$NOTIFIER_SCRIPT_PATH:755"
+    "$NOTIFIER_LAUNCHDAEMON_PATH:644"
+    "$WATCHDOG_SCRIPT_PATH:755"
+    "$WATCHDOG_LAUNCHDAEMON_PATH:644"
+)
+
+log_message() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+
+    timestamp="$(/bin/date '+%Y-%m-%d %H:%M:%S')"
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+}
+
+log_message "INFO" "Watchdog check started"
+
+for item_entry in "${PROTECTED_ITEMS[@]}"; do
+    item_path="${item_entry%%:*}"
+    expected_perms="${item_entry##*:}"
+
+    if [[ ! -e "$item_path" ]]; then
+        log_message "ERROR" "Missing protected item: $item_path"
+        continue
+    fi
+
+    /usr/bin/chflags nouchg "$item_path" 2>/dev/null
+
+    current_owner="$(/usr/bin/stat -f "%Su:%Sg" "$item_path" 2>/dev/null)"
+    current_perms="$(/usr/bin/stat -f "%Lp" "$item_path" 2>/dev/null)"
+
+    if [[ "$current_owner" != "root:wheel" ]]; then
+        log_message "WARN" "Correcting ownership on: $item_path"
+        /usr/sbin/chown root:wheel "$item_path"
+    fi
+
+    if [[ "$current_perms" != "$expected_perms" ]]; then
+        log_message "WARN" "Correcting permissions on: $item_path to $expected_perms"
+        /bin/chmod "$expected_perms" "$item_path"
+    fi
+
+    /usr/bin/chflags uchg "$item_path" 2>/dev/null
+done
+
+if [[ -f "$NOTIFIER_LAUNCHDAEMON_PATH" ]]; then
+    if ! /bin/launchctl print "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1; then
+        log_message "WARN" "Notifier LaunchDaemon is not loaded. Attempting bootstrap."
+
+        /usr/bin/chflags nouchg "$NOTIFIER_LAUNCHDAEMON_PATH" 2>/dev/null
+
+        /bin/launchctl bootstrap system "$NOTIFIER_LAUNCHDAEMON_PATH" >/dev/null 2>&1
+        bootstrap_result="$?"
+
+        /usr/bin/chflags uchg "$NOTIFIER_LAUNCHDAEMON_PATH" 2>/dev/null
+
+        if [[ "$bootstrap_result" -eq 0 ]]; then
+            log_message "INFO" "Notifier LaunchDaemon bootstrapped successfully."
+        else
+            log_message "ERROR" "Failed to bootstrap notifier LaunchDaemon. Exit code: $bootstrap_result"
+        fi
+    else
+        log_message "INFO" "Notifier LaunchDaemon is loaded."
+    fi
+
+    /bin/launchctl enable "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+    /bin/launchctl kickstart -k "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+fi
+
+log_message "INFO" "Watchdog check completed"
+
+exit 0
+WATCHDOG_SCRIPT
+
+####################################################################################################
+# Write watchdog LaunchDaemon
+####################################################################################################
+
+log_info "Writing watchdog LaunchDaemon: ${WATCHDOG_LAUNCHDAEMON_PATH}"
+
+cat > "$WATCHDOG_LAUNCHDAEMON_PATH" <<WATCHDOG_LAUNCHDAEMON_PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${WATCHDOG_LAUNCHDAEMON_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${WATCHDOG_SCRIPT_PATH}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/blocked-binary-notifier-watchdog.launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/blocked-binary-notifier-watchdog.launchd.error.log</string>
+</dict>
+</plist>
+WATCHDOG_LAUNCHDAEMON_PLIST
+
+####################################################################################################
+# Permissions
+####################################################################################################
+
+log_info "Setting permissions."
+
+/usr/sbin/chown root:wheel "$NOTIFIER_SCRIPT_PATH"
+/bin/chmod 755 "$NOTIFIER_SCRIPT_PATH"
+
+/usr/sbin/chown root:wheel "$NOTIFIER_LAUNCHDAEMON_PATH"
+/bin/chmod 644 "$NOTIFIER_LAUNCHDAEMON_PATH"
+
+/usr/sbin/chown root:wheel "$WATCHDOG_SCRIPT_PATH"
+/bin/chmod 755 "$WATCHDOG_SCRIPT_PATH"
+
+/usr/sbin/chown root:wheel "$WATCHDOG_LAUNCHDAEMON_PATH"
+/bin/chmod 644 "$WATCHDOG_LAUNCHDAEMON_PATH"
+
+####################################################################################################
+# Validation
+####################################################################################################
+
+log_info "Validating notifier script."
+
+BASH_VALIDATION_OUTPUT="$(/bin/bash -n "$NOTIFIER_SCRIPT_PATH" 2>&1)"
+BASH_VALIDATION_RESULT="$?"
+
+if [[ "$BASH_VALIDATION_RESULT" -eq 0 ]]; then
+    log_info "Notifier script passed bash syntax validation."
+else
+    log_error "Notifier script failed bash syntax validation."
+    log_error "$BASH_VALIDATION_OUTPUT"
+    exit 1
+fi
+
+log_info "Validating watchdog script."
+
+WATCHDOG_VALIDATION_OUTPUT="$(/bin/bash -n "$WATCHDOG_SCRIPT_PATH" 2>&1)"
+WATCHDOG_VALIDATION_RESULT="$?"
+
+if [[ "$WATCHDOG_VALIDATION_RESULT" -eq 0 ]]; then
+    log_info "Watchdog script passed bash syntax validation."
+else
+    log_error "Watchdog script failed bash syntax validation."
+    log_error "$WATCHDOG_VALIDATION_OUTPUT"
+    exit 1
+fi
+
+log_info "Validating notifier LaunchDaemon plist."
+
+PLIST_VALIDATION_OUTPUT="$(/usr/bin/plutil -lint "$NOTIFIER_LAUNCHDAEMON_PATH" 2>&1)"
+PLIST_VALIDATION_RESULT="$?"
+
+if [[ "$PLIST_VALIDATION_RESULT" -eq 0 ]]; then
+    log_info "Notifier LaunchDaemon plist passed validation."
+else
+    log_error "Notifier LaunchDaemon plist failed validation."
+    log_error "$PLIST_VALIDATION_OUTPUT"
+    exit 1
+fi
+
+log_info "Validating watchdog LaunchDaemon plist."
+
+WATCHDOG_PLIST_VALIDATION_OUTPUT="$(/usr/bin/plutil -lint "$WATCHDOG_LAUNCHDAEMON_PATH" 2>&1)"
+WATCHDOG_PLIST_VALIDATION_RESULT="$?"
+
+if [[ "$WATCHDOG_PLIST_VALIDATION_RESULT" -eq 0 ]]; then
+    log_info "Watchdog LaunchDaemon plist passed validation."
+else
+    log_error "Watchdog LaunchDaemon plist failed validation."
+    log_error "$WATCHDOG_PLIST_VALIDATION_OUTPUT"
+    exit 1
+fi
+
+####################################################################################################
+# Load/reload notifier LaunchDaemon
+####################################################################################################
+
+log_info "Removing existing notifier LaunchDaemon if present."
+
+/bin/launchctl bootout "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+/bin/launchctl bootout system "$NOTIFIER_LAUNCHDAEMON_PATH" >/dev/null 2>&1
+
+log_info "Loading notifier LaunchDaemon."
+
+NOTIFIER_BOOTSTRAP_OUTPUT="$(/bin/launchctl bootstrap system "$NOTIFIER_LAUNCHDAEMON_PATH" 2>&1)"
+NOTIFIER_BOOTSTRAP_RESULT="$?"
+
+if [[ "$NOTIFIER_BOOTSTRAP_RESULT" -eq 0 ]]; then
+    log_info "Notifier LaunchDaemon bootstrapped successfully."
+else
+    log_error "Failed to bootstrap notifier LaunchDaemon."
+    log_error "bootstrap exit code: ${NOTIFIER_BOOTSTRAP_RESULT}"
+    log_error "bootstrap output: ${NOTIFIER_BOOTSTRAP_OUTPUT}"
+    exit 1
+fi
+
+/bin/launchctl enable "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+/bin/launchctl kickstart -k "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+
+####################################################################################################
+# Load/reload watchdog LaunchDaemon
+####################################################################################################
+
+log_info "Removing existing watchdog LaunchDaemon if present."
+
+/bin/launchctl bootout "system/${WATCHDOG_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+/bin/launchctl bootout system "$WATCHDOG_LAUNCHDAEMON_PATH" >/dev/null 2>&1
+
+log_info "Loading watchdog LaunchDaemon."
+
+WATCHDOG_BOOTSTRAP_OUTPUT="$(/bin/launchctl bootstrap system "$WATCHDOG_LAUNCHDAEMON_PATH" 2>&1)"
+WATCHDOG_BOOTSTRAP_RESULT="$?"
+
+if [[ "$WATCHDOG_BOOTSTRAP_RESULT" -eq 0 ]]; then
+    log_info "Watchdog LaunchDaemon bootstrapped successfully."
+else
+    log_error "Failed to bootstrap watchdog LaunchDaemon."
+    log_error "bootstrap exit code: ${WATCHDOG_BOOTSTRAP_RESULT}"
+    log_error "bootstrap output: ${WATCHDOG_BOOTSTRAP_OUTPUT}"
+    exit 1
+fi
+
+/bin/launchctl enable "system/${WATCHDOG_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+/bin/launchctl kickstart -k "system/${WATCHDOG_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1
+
+####################################################################################################
+# Apply immutable flag after successful deployment
+####################################################################################################
+
+log_info "Applying immutable flags to deployment files."
+
+for item in "${PROTECTED_FILES[@]}"; do
+    if [[ -e "$item" ]]; then
+        log_info "Applying immutable flag to: $item"
+        /usr/bin/chflags uchg "$item" 2>/dev/null
+    else
+        log_warn "Cannot apply immutable flag because file is missing: $item"
+    fi
+done
+
+####################################################################################################
+# Final status
+####################################################################################################
+
+if /bin/launchctl print "system/${NOTIFIER_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1; then
+    log_info "Notifier LaunchDaemon is loaded: ${NOTIFIER_LAUNCHDAEMON_LABEL}"
+else
+    log_error "Notifier LaunchDaemon does not appear to be loaded."
+    exit 1
+fi
+
+if /bin/launchctl print "system/${WATCHDOG_LAUNCHDAEMON_LABEL}" >/dev/null 2>&1; then
+    log_info "Watchdog LaunchDaemon is loaded: ${WATCHDOG_LAUNCHDAEMON_LABEL}"
+else
+    log_error "Watchdog LaunchDaemon does not appear to be loaded."
+    exit 1
+fi
+
+log_info "Deployment completed successfully."
+log_info "Notifier script: ${NOTIFIER_SCRIPT_PATH}"
+log_info "Notifier LaunchDaemon: ${NOTIFIER_LAUNCHDAEMON_PATH}"
+log_info "Watchdog script: ${WATCHDOG_SCRIPT_PATH}"
+log_info "Watchdog LaunchDaemon: ${WATCHDOG_LAUNCHDAEMON_PATH}"
+log_info "Deployment log: ${DEPLOY_LOG}"
+log_info "Notifier runtime log: /var/log/blocked-binary-notifier.log"
+log_info "Watchdog runtime log: /var/log/blocked-binary-notifier-watchdog.log"
+log_info "Immutable protection has been applied to notifier and watchdog files."
+
+exit 0
